@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build and package output
+*.vsix
+out/
+dist/
+coverage/
+
+# Runtime bridge state
+.nbctl-state.json
+.notebook-bridge/
+
+# Logs and diagnostics
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS/editor noise
+.DS_Store
+.idea/
+
+# Environment overrides
+.env
+.env.*
+!.env.example

@@ -1,0 +1,5 @@
+.git/**
+.gitignore
+.nbctl-state.json
+.vscode/**
+*.vsix

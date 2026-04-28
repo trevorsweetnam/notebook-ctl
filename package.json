@@ -1,0 +1,48 @@
+{
+  "name": "notebook-bridge",
+  "displayName": "Notebook Bridge",
+  "description": "Minimal VS Code notebook bridge for live notebook inspection from a local CLI.",
+  "version": "0.0.1",
+  "private": true,
+  "license": "UNLICENSED",
+  "publisher": "local",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/trevorsweetnam/notebook-ctl.git"
+  },
+  "bugs": {
+    "url": "https://github.com/trevorsweetnam/notebook-ctl/issues"
+  },
+  "homepage": "https://github.com/trevorsweetnam/notebook-ctl#readme",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "workspaceContains:**/*.ipynb",
+    "onNotebook:jupyter-notebook",
+    "onCommand:notebookBridge.showServerInfo"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "notebookBridge.showServerInfo",
+        "title": "Notebook Bridge: Show Server Info"
+      }
+    ]
+  },
+  "bin": {
+    "nbctl": "./bin/nbctl.js"
+  },
+  "scripts": {
+    "nbctl": "node ./bin/nbctl.js",
+    "link:global": "npm link",
+    "test": "node --test",
+    "package:vsix": "npx @vscode/vsce package --allow-missing-repository",
+    "install:vsix": "\"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code\" --install-extension ./notebook-bridge-0.0.1.vsix --force"
+  }
+}

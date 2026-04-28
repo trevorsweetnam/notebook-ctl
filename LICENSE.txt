@@ -1,0 +1,5 @@
+UNLICENSED
+
+This project is not licensed for public use, redistribution, or modification.
+
+All rights reserved.
