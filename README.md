@@ -259,3 +259,7 @@ git add .
 git commit -m "Initial notebook ctl project"
 git push -u origin main
 ```
+
+## License
+
+MIT

@@ -1,6 +1,6 @@
 # Contributing
 
-This project is currently private and unlicensed for public redistribution.
+This project is licensed under the MIT License.
 
 ## Local Checks
 

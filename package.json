@@ -4,7 +4,7 @@
   "description": "Minimal VS Code notebook bridge for live notebook inspection from a local CLI.",
   "version": "0.0.1",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "publisher": "local",
   "repository": {
     "type": "git",
