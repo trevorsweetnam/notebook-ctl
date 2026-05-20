@@ -181,6 +181,7 @@ async function doctor() {
       result.state = {
         extension_path: state.extension_path || null,
         port: state.port || null,
+        log_file: state.log_file || null,
         updated_at: state.updated_at || null
       };
       result.health = await requestJson(state, "/health");

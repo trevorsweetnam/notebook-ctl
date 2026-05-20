@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 const vscode = require("vscode");
 const { summarizeCell } = require("./lib/notebook-inspection");
+const { createLogger } = require("./lib/logger");
 
 function stateFilePath() {
   return path.join(os.homedir(), ".notebook-bridge", "state.json");
@@ -474,7 +475,7 @@ function isAuthorized(req, token) {
   return auth === `Bearer ${token}`;
 }
 
-async function handleRequest(req, res, token, outputChannel) {
+async function handleRequest(req, res, token, outputChannel, logger) {
   if (!isAuthorized(req, token)) {
     sendJson(res, 401, { error: "Unauthorized" });
     return;
@@ -491,45 +492,55 @@ async function handleRequest(req, res, token, outputChannel) {
   }
 
   const body = await readJsonBody(req);
+  const startMs = Date.now();
   outputChannel.appendLine(`Notebook Bridge request ${req.url}`);
+  logger.request(req.url, body);
+
+  const originalSendJson = sendJson;
+  const loggedSendJson = (r, statusCode, payload) => {
+    const ms = Date.now() - startMs;
+    const errorMessage = statusCode >= 400 ? (payload.error || null) : null;
+    logger.response(req.url, statusCode, ms, errorMessage);
+    originalSendJson(r, statusCode, payload);
+  };
 
   if (req.url === "/list-open") {
     const notebooks = vscode.workspace.notebookDocuments.map(toNotebookSummary);
-    sendJson(res, 200, { notebooks });
+    loggedSendJson(res, 200, { notebooks });
     return;
   }
 
   if (req.url === "/get") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
-    sendJson(res, 200, toNotebookDetail(notebook));
+    loggedSendJson(res, 200, toNotebookDetail(notebook));
     return;
   }
 
   if (req.url === "/inspect" || req.url === "/list-cells") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
-    sendJson(res, 200, toNotebookInspection(notebook));
+    loggedSendJson(res, 200, toNotebookInspection(notebook));
     return;
   }
 
   if (req.url === "/get-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
     const cell = getCellOrThrow(notebook, body.cell_index);
-    sendJson(res, 200, {
+    loggedSendJson(res, 200, {
       notebook_uri: notebook.uri.toString(),
       file_path: notebook.uri.fsPath,
       cell: toCellSourceInfo(cell, body.cell_index)
@@ -540,12 +551,12 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/get-outputs") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
     const cell = getCellOrThrow(notebook, body.cell_index);
-    sendJson(res, 200, {
+    loggedSendJson(res, 200, {
       notebook_uri: notebook.uri.toString(),
       file_path: notebook.uri.fsPath,
       cell: toCellOutputsInfo(cell, body.cell_index)
@@ -556,18 +567,18 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/replace-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
     if (typeof body.source !== "string") {
-      sendJson(res, 400, { error: "Missing replacement source text." });
+      loggedSendJson(res, 400, { error: "Missing replacement source text." });
       return;
     }
 
     await replaceNotebookCellSource(notebook, body.cell_index, body.source, Boolean(body.save));
     const replacedCell = getCellOrThrow(notebook, body.cell_index);
-    sendJson(res, 200, {
+    loggedSendJson(res, 200, {
       notebook_uri: notebook.uri.toString(),
       file_path: notebook.uri.fsPath,
       cell: toCellSourceInfo(replacedCell, body.cell_index)
@@ -578,12 +589,12 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/replace-and-run") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
     if (typeof body.source !== "string") {
-      sendJson(res, 400, { error: "Missing replacement source text." });
+      loggedSendJson(res, 400, { error: "Missing replacement source text." });
       return;
     }
 
@@ -597,14 +608,14 @@ async function handleRequest(req, res, token, outputChannel) {
       Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000,
       ac.signal
     );
-    sendJson(res, 200, result);
+    loggedSendJson(res, 200, result);
     return;
   }
 
   if (req.url === "/run-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
@@ -617,14 +628,14 @@ async function handleRequest(req, res, token, outputChannel) {
       Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000,
       ac.signal
     );
-    sendJson(res, 200, result);
+    loggedSendJson(res, 200, result);
     return;
   }
 
   if (req.url === "/run-all") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
@@ -636,54 +647,57 @@ async function handleRequest(req, res, token, outputChannel) {
       Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000,
       ac.signal
     );
-    sendJson(res, 200, result);
+    loggedSendJson(res, 200, result);
     return;
   }
 
   if (req.url === "/add-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
     if (typeof body.source !== "string") {
-      sendJson(res, 400, { error: "Missing new cell source text." });
+      loggedSendJson(res, 400, { error: "Missing new cell source text." });
       return;
     }
 
     if (body.kind !== "code" && body.kind !== "markdown") {
-      sendJson(res, 400, { error: "Cell kind must be `code` or `markdown`." });
+      loggedSendJson(res, 400, { error: "Cell kind must be `code` or `markdown`." });
       return;
     }
 
     await addNotebookCell(notebook, body.cell_index, body.kind, body.language, body.source, Boolean(body.save));
-    sendJson(res, 200, toNotebookDetail(notebook));
+    loggedSendJson(res, 200, toNotebookDetail(notebook));
     return;
   }
 
   if (req.url === "/delete-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
     await deleteNotebookCell(notebook, body.cell_index, Boolean(body.save));
-    sendJson(res, 200, toNotebookDetail(notebook));
+    loggedSendJson(res, 200, toNotebookDetail(notebook));
     return;
   }
 
-  sendJson(res, 404, { error: "Unknown endpoint" });
+  loggedSendJson(res, 404, { error: "Unknown endpoint" });
 }
 
 async function activate(context) {
   const outputChannel = vscode.window.createOutputChannel("Notebook Bridge");
+  const logFile = path.join(os.homedir(), ".notebook-bridge", "bridge.log");
+  const logger = createLogger(logFile);
   const token = crypto.randomBytes(24).toString("hex");
 
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, token, outputChannel).catch((error) => {
+    handleRequest(req, res, token, outputChannel, logger).catch((error) => {
       outputChannel.appendLine(`Notebook Bridge error: ${error.stack || error.message}`);
+      logger.error(error.stack || error.message);
       sendJson(res, 500, { error: error.message });
     });
   });
@@ -703,6 +717,7 @@ async function activate(context) {
     extension_path: __dirname,
     port: address.port,
     token,
+    log_file: logFile,
     state_file: stateFilePath(),
     state_files: stateFilePaths(),
     updated_at: new Date().toISOString()
@@ -711,6 +726,8 @@ async function activate(context) {
   const writtenStateFiles = writeStateFiles(state, outputChannel);
   outputChannel.appendLine(`Notebook Bridge listening on http://127.0.0.1:${address.port}`);
   outputChannel.appendLine(`State files: ${writtenStateFiles.join(", ")}`);
+  outputChannel.appendLine(`Log file: ${logFile}`);
+  logger.info(`Server started on port ${address.port} state=${writtenStateFiles[0]}`);
 
   const showServerInfo = vscode.commands.registerCommand("notebookBridge.showServerInfo", async () => {
     await vscode.window.showInformationMessage(
