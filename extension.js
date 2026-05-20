@@ -37,15 +37,11 @@ function writeStateFiles(state, outputChannel) {
   return written;
 }
 
-function getVisibleNotebookEditors() {
-  return vscode.window.visibleNotebookEditors;
-}
-
 function decodeOutputItemData(item) {
   const mime = item.mime;
   const bytes = Buffer.from(item.data);
 
-  if (mime.startsWith("text/") || mime === "application/x.notebook.stdout" || mime === "application/x.notebook.stderr") {
+  if (mime.startsWith("text/") || mime === "application/x.notebook.stdout" || mime === "application/x.notebook.stderr" || mime === "application/vnd.code.notebook.stdout" || mime === "application/vnd.code.notebook.stderr") {
     return {
       mime,
       format: "text",
@@ -95,35 +91,6 @@ function toOutputInfo(output, index) {
 
 function outputByteLength(output) {
   return output.items.reduce((total, item) => total + Buffer.from(item.data).length, 0);
-}
-
-function hashText(value) {
-  return crypto.createHash("sha256").update(value).digest("hex");
-}
-
-function summarizeOutputItem(item) {
-  const decoded = decodeOutputItemData(item);
-  if (decoded.format === "text") {
-    return {
-      mime: decoded.mime,
-      format: decoded.format,
-      text_preview: decoded.text.slice(0, 200)
-    };
-  }
-
-  if (decoded.format === "json") {
-    return {
-      mime: decoded.mime,
-      format: decoded.format,
-      json_preview: JSON.stringify(decoded.json).slice(0, 200)
-    };
-  }
-
-  return {
-    mime: decoded.mime,
-    format: decoded.format,
-    data_preview: decoded.base64.slice(0, 200)
-  };
 }
 
 function toExecutionSummary(cell) {
@@ -178,20 +145,24 @@ function toCellOutputsInfo(cell, index) {
   };
 }
 
-function toNotebookSummary(editor) {
-  const notebook = editor.notebook;
+function isNotebookVisible(notebook) {
+  return vscode.window.visibleNotebookEditors.some(
+    (editor) => editor.notebook.uri.toString() === notebook.uri.toString()
+  );
+}
+
+function toNotebookSummary(notebook) {
   return {
     notebook_uri: notebook.uri.toString(),
     file_path: notebook.uri.fsPath,
     notebook_type: notebook.notebookType,
     cell_count: notebook.cellCount,
     is_active: vscode.window.activeNotebookEditor?.notebook.uri.toString() === notebook.uri.toString(),
-    is_visible: true
+    is_visible: isNotebookVisible(notebook)
   };
 }
 
-function toNotebookDetail(editor) {
-  const notebook = editor.notebook;
+function toNotebookDetail(notebook) {
   const cells = [];
   for (let index = 0; index < notebook.cellCount; index += 1) {
     cells.push(toCellInfo(notebook.cellAt(index), index));
@@ -206,8 +177,7 @@ function toNotebookDetail(editor) {
   };
 }
 
-function toNotebookInspection(editor) {
-  const notebook = editor.notebook;
+function toNotebookInspection(notebook) {
   const cells = [];
   let totalSourceLength = 0;
   let totalOutputBytes = 0;
@@ -239,31 +209,31 @@ function toCellListItem(cell, index) {
   );
 }
 
-function toCellDetail(cell, index) {
-  return toCellSourceInfo(cell, index);
-}
-
-function toCellOutputsDetail(cell, index) {
-  return toCellOutputsInfo(cell, index);
-}
-
 function findOpenNotebook(targets) {
   const normalizedTargets = []
     .concat(targets || [])
     .filter(Boolean)
     .map((target) => String(target));
 
-  return getVisibleNotebookEditors().find((editor) => {
-    const uri = editor.notebook.uri;
+  return vscode.workspace.notebookDocuments.find((notebook) => {
+    const uri = notebook.uri;
     return normalizedTargets.includes(uri.toString()) || normalizedTargets.includes(uri.fsPath);
   });
 }
 
-async function focusNotebookEditor(editor) {
-  return vscode.window.showNotebookDocument(editor.notebook, {
-    preserveFocus: false,
+// Finds the existing visible editor for a notebook, or opens it in a side
+// panel with preserveFocus so the user's current editor keeps focus.
+async function getOrEnsureNotebookEditor(notebook) {
+  const existing = vscode.window.visibleNotebookEditors.find(
+    (editor) => editor.notebook.uri.toString() === notebook.uri.toString()
+  );
+  if (existing) {
+    return existing;
+  }
+  return vscode.window.showNotebookDocument(notebook, {
+    preserveFocus: true,
     preview: false,
-    viewColumn: editor.viewColumn
+    viewColumn: vscode.ViewColumn.Beside
   });
 }
 
@@ -282,7 +252,7 @@ function snapshotNotebookState(notebook) {
   return JSON.stringify(cells);
 }
 
-function waitForNotebookMutation(notebook, hasChanged, timeoutMs) {
+function waitForNotebookMutation(notebook, hasChanged, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
     const quietPeriodMs = 750;
     let quietTimer;
@@ -307,6 +277,11 @@ function waitForNotebookMutation(notebook, hasChanged, timeoutMs) {
       }, quietPeriodMs);
     });
 
+    const onAbort = () => {
+      cleanup();
+      resolve();
+    };
+
     const cleanup = () => {
       subscription.dispose();
       if (quietTimer) {
@@ -315,7 +290,17 @@ function waitForNotebookMutation(notebook, hasChanged, timeoutMs) {
       if (timeoutTimer) {
         clearTimeout(timeoutTimer);
       }
+      signal?.removeEventListener("abort", onAbort);
     };
+
+    if (signal) {
+      if (signal.aborted) {
+        cleanup();
+        resolve();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     timeoutTimer = setTimeout(() => {
       cleanup();
@@ -331,12 +316,11 @@ function waitForNotebookMutation(notebook, hasChanged, timeoutMs) {
   });
 }
 
-async function runNotebookCell(editor, cellIndex, waitForChange, timeoutMs) {
-  const notebook = editor.notebook;
+async function runNotebookCell(notebook, cellIndex, waitForChange, timeoutMs, signal) {
   const cell = getCellOrThrow(notebook, cellIndex);
   const before = snapshotCellState(cell);
 
-  await focusNotebookEditor(editor);
+  await getOrEnsureNotebookEditor(notebook);
   await vscode.commands.executeCommand("notebook.cell.execute", {
     document: notebook.uri,
     ranges: [{ start: cellIndex, end: cellIndex + 1 }]
@@ -346,7 +330,8 @@ async function runNotebookCell(editor, cellIndex, waitForChange, timeoutMs) {
     await waitForNotebookMutation(
       notebook,
       () => snapshotCellState(notebook.cellAt(cellIndex)) !== before,
-      timeoutMs
+      timeoutMs,
+      signal
     );
   }
 
@@ -354,22 +339,22 @@ async function runNotebookCell(editor, cellIndex, waitForChange, timeoutMs) {
     notebook_uri: notebook.uri.toString(),
     file_path: notebook.uri.fsPath,
     waited: waitForChange,
-    cell: toCellOutputsDetail(notebook.cellAt(cellIndex), cellIndex)
+    cell: toCellOutputsInfo(notebook.cellAt(cellIndex), cellIndex)
   };
 }
 
-async function runNotebookAll(editor, waitForChange, timeoutMs) {
-  const notebook = editor.notebook;
+async function runNotebookAll(notebook, waitForChange, timeoutMs, signal) {
   const before = snapshotNotebookState(notebook);
 
-  await focusNotebookEditor(editor);
+  await getOrEnsureNotebookEditor(notebook);
   await vscode.commands.executeCommand("notebook.execute", notebook.uri);
 
   if (waitForChange) {
     await waitForNotebookMutation(
       notebook,
       () => snapshotNotebookState(notebook) !== before,
-      timeoutMs
+      timeoutMs,
+      signal
     );
   }
 
@@ -377,18 +362,18 @@ async function runNotebookAll(editor, waitForChange, timeoutMs) {
     notebook_uri: notebook.uri.toString(),
     file_path: notebook.uri.fsPath,
     waited: waitForChange,
-    notebook: toNotebookDetail(editor)
+    notebook: toNotebookDetail(notebook)
   };
 }
 
-async function replaceNotebookCellSource(editor, cellIndex, source) {
-  const currentCell = getCellOrThrow(editor.notebook, cellIndex);
-  return applyNotebookEdit(editor.notebook, [
+async function replaceNotebookCellSource(notebook, cellIndex, source, save = false) {
+  const currentCell = getCellOrThrow(notebook, cellIndex);
+  return applyNotebookEdit(notebook, [
     vscode.NotebookEdit.replaceCells(
       new vscode.NotebookRange(cellIndex, cellIndex + 1),
       [createCellDataFromExistingCell(currentCell, source)]
     )
-  ]);
+  ], save);
 }
 
 function createCellDataFromExistingCell(cell, source) {
@@ -418,7 +403,7 @@ function createCellData(kind, language, source) {
   return cell;
 }
 
-async function applyNotebookEdit(notebook, edits) {
+async function applyNotebookEdit(notebook, edits, save = false) {
   const edit = new vscode.WorkspaceEdit();
   edit.set(notebook.uri, edits);
 
@@ -427,8 +412,9 @@ async function applyNotebookEdit(notebook, edits) {
     throw new Error("VS Code rejected the notebook edit.");
   }
 
-  const saved = await notebook.save();
-  return { saved };
+  if (save) {
+    await notebook.save();
+  }
 }
 
 function getCellOrThrow(notebook, cellIndex) {
@@ -438,24 +424,22 @@ function getCellOrThrow(notebook, cellIndex) {
   return notebook.cellAt(cellIndex);
 }
 
-async function addNotebookCell(editor, cellIndex, kind, language, source) {
-  const notebook = editor.notebook;
+async function addNotebookCell(notebook, cellIndex, kind, language, source, save = false) {
   if (!Number.isInteger(cellIndex) || cellIndex < 0 || cellIndex > notebook.cellCount) {
     throw new Error(`Insert index ${cellIndex} is out of range for notebook with ${notebook.cellCount} cells.`);
   }
 
   return applyNotebookEdit(notebook, [
     vscode.NotebookEdit.insertCells(cellIndex, [createCellData(kind, language, source)])
-  ]);
+  ], save);
 }
 
-async function deleteNotebookCell(editor, cellIndex) {
-  const notebook = editor.notebook;
+async function deleteNotebookCell(notebook, cellIndex, save = false) {
   getCellOrThrow(notebook, cellIndex);
 
   return applyNotebookEdit(notebook, [
     vscode.NotebookEdit.deleteCells(new vscode.NotebookRange(cellIndex, cellIndex + 1))
-  ]);
+  ], save);
 }
 
 function readJsonBody(req) {
@@ -510,7 +494,7 @@ async function handleRequest(req, res, token, outputChannel) {
   outputChannel.appendLine(`Notebook Bridge request ${req.url}`);
 
   if (req.url === "/list-open") {
-    const notebooks = getVisibleNotebookEditors().map(toNotebookSummary);
+    const notebooks = vscode.workspace.notebookDocuments.map(toNotebookSummary);
     sendJson(res, 200, { notebooks });
     return;
   }
@@ -518,9 +502,7 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/get") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
@@ -531,9 +513,7 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/inspect" || req.url === "/list-cells") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
@@ -544,17 +524,15 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/get-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
-    const cell = getCellOrThrow(notebook.notebook, body.cell_index);
+    const cell = getCellOrThrow(notebook, body.cell_index);
     sendJson(res, 200, {
-      notebook_uri: notebook.notebook.uri.toString(),
-      file_path: notebook.notebook.uri.fsPath,
-      cell: toCellDetail(cell, body.cell_index)
+      notebook_uri: notebook.uri.toString(),
+      file_path: notebook.uri.fsPath,
+      cell: toCellSourceInfo(cell, body.cell_index)
     });
     return;
   }
@@ -562,17 +540,15 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/get-outputs") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
-    const cell = getCellOrThrow(notebook.notebook, body.cell_index);
+    const cell = getCellOrThrow(notebook, body.cell_index);
     sendJson(res, 200, {
-      notebook_uri: notebook.notebook.uri.toString(),
-      file_path: notebook.notebook.uri.fsPath,
-      cell: toCellOutputsDetail(cell, body.cell_index)
+      notebook_uri: notebook.uri.toString(),
+      file_path: notebook.uri.fsPath,
+      cell: toCellOutputsInfo(cell, body.cell_index)
     });
     return;
   }
@@ -580,38 +556,66 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/replace-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
     if (typeof body.source !== "string") {
-      sendJson(res, 400, {
-        error: "Missing replacement source text."
-      });
+      sendJson(res, 400, { error: "Missing replacement source text." });
       return;
     }
 
-    await replaceNotebookCellSource(notebook, body.cell_index, body.source);
-    sendJson(res, 200, toNotebookDetail(notebook));
+    await replaceNotebookCellSource(notebook, body.cell_index, body.source, Boolean(body.save));
+    const replacedCell = getCellOrThrow(notebook, body.cell_index);
+    sendJson(res, 200, {
+      notebook_uri: notebook.uri.toString(),
+      file_path: notebook.uri.fsPath,
+      cell: toCellSourceInfo(replacedCell, body.cell_index)
+    });
+    return;
+  }
+
+  if (req.url === "/replace-and-run") {
+    const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
+    if (!notebook) {
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      return;
+    }
+
+    if (typeof body.source !== "string") {
+      sendJson(res, 400, { error: "Missing replacement source text." });
+      return;
+    }
+
+    await replaceNotebookCellSource(notebook, body.cell_index, body.source, Boolean(body.save));
+    const ac = new AbortController();
+    req.on("close", () => ac.abort());
+    const result = await runNotebookCell(
+      notebook,
+      body.cell_index,
+      true,
+      Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000,
+      ac.signal
+    );
+    sendJson(res, 200, result);
     return;
   }
 
   if (req.url === "/run-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
+    const ac = new AbortController();
+    req.on("close", () => ac.abort());
     const result = await runNotebookCell(
       notebook,
       body.cell_index,
       Boolean(body.wait),
-      Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000
+      Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000,
+      ac.signal
     );
     sendJson(res, 200, result);
     return;
@@ -620,16 +624,17 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/run-all") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
+    const ac = new AbortController();
+    req.on("close", () => ac.abort());
     const result = await runNotebookAll(
       notebook,
       Boolean(body.wait),
-      Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000
+      Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000,
+      ac.signal
     );
     sendJson(res, 200, result);
     return;
@@ -638,9 +643,7 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/add-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
@@ -654,7 +657,7 @@ async function handleRequest(req, res, token, outputChannel) {
       return;
     }
 
-    await addNotebookCell(notebook, body.cell_index, body.kind, body.language, body.source);
+    await addNotebookCell(notebook, body.cell_index, body.kind, body.language, body.source, Boolean(body.save));
     sendJson(res, 200, toNotebookDetail(notebook));
     return;
   }
@@ -662,13 +665,11 @@ async function handleRequest(req, res, token, outputChannel) {
   if (req.url === "/delete-cell") {
     const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
     if (!notebook) {
-      sendJson(res, 404, {
-        error: "Notebook is not open in a visible VS Code notebook editor."
-      });
+      sendJson(res, 404, { error: "Notebook is not open in VS Code." });
       return;
     }
 
-    await deleteNotebookCell(notebook, body.cell_index);
+    await deleteNotebookCell(notebook, body.cell_index, Boolean(body.save));
     sendJson(res, 200, toNotebookDetail(notebook));
     return;
   }
@@ -691,6 +692,7 @@ async function activate(context) {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => resolve());
   });
+  server.unref();
 
   const address = server.address();
   if (!address || typeof address === "string") {

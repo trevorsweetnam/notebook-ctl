@@ -29,11 +29,12 @@ function usage() {
   nbctl get <notebook-uri-or-path>
   nbctl get-cell <notebook-uri-or-path> <cell-index>
   nbctl get-outputs <notebook-uri-or-path> <cell-index>
-  nbctl run-cell <notebook-uri-or-path> <cell-index> [--wait] [--timeout-ms <ms>]
+  nbctl run-cell <notebook-uri-or-path> <cell-index> [--wait] [--timeout-ms <ms>] [--text]
   nbctl run-all <notebook-uri-or-path> [--wait] [--timeout-ms <ms>]
-  nbctl replace-cell <notebook-uri-or-path> <cell-index> (--text <text> | --file <path>)
-  nbctl add-cell <notebook-uri-or-path> <insert-index> --kind <code|markdown> [--language <id>] (--text <text> | --file <path>)
-  nbctl delete-cell <notebook-uri-or-path> <cell-index>
+  nbctl replace-cell <notebook-uri-or-path> <cell-index> (--text <text> | --file <path>) [--save]
+  nbctl replace-and-run <notebook-uri-or-path> <cell-index> (--text <text> | --file <path>) [--timeout-ms <ms>] [--save] [--print]
+  nbctl add-cell <notebook-uri-or-path> <insert-index> --kind <code|markdown> [--language <id>] (--text <text> | --file <path>) [--save]
+  nbctl delete-cell <notebook-uri-or-path> <cell-index> [--save]
   nbctl bootstrap
   nbctl doctor
   nbctl status
@@ -400,6 +401,14 @@ function parseCellIndex(rawValue, label) {
 }
 
 function readSourceFile(filePath) {
+  if (filePath === "-") {
+    try {
+      return fs.readFileSync(0, "utf8");
+    } catch (error) {
+      throw createCliError("invalid_argument", "Failed to read from stdin.", { reason: error.message });
+    }
+  }
+
   const absolutePath = path.resolve(filePath);
   try {
     return fs.readFileSync(absolutePath, "utf8");
@@ -467,10 +476,12 @@ function parseReplaceCellArgs(args) {
     throw createCliError("invalid_argument", "Missing cell index for `replace-cell`.");
   }
 
+  const save = args.includes("--save");
   return {
     target,
     cellIndex: parseCellIndex(cellIndexRaw, "cell index"),
-    source: parseSourceOption(args, 2)
+    source: parseSourceOption(args, 2),
+    save
   };
 }
 
@@ -516,6 +527,10 @@ function parseAddCellArgs(args) {
       break;
     }
 
+    if (arg === "--save") {
+      continue;
+    }
+
     throw createCliError("invalid_argument", `Unknown argument for \`add-cell\`: ${arg}`, { argument: arg });
   }
 
@@ -527,7 +542,8 @@ function parseAddCellArgs(args) {
     throw createCliError("invalid_argument", "Missing new cell content. Use `--text` or `--file`.");
   }
 
-  return { target, cellIndex, kind, language, source };
+  const save = args.includes("--save");
+  return { target, cellIndex, kind, language, source, save };
 }
 
 function parseNotebookAndIndexArgs(command, args) {
@@ -544,7 +560,8 @@ function parseNotebookAndIndexArgs(command, args) {
 
   return {
     target,
-    cellIndex: parseCellIndex(cellIndexRaw, "cell index")
+    cellIndex: parseCellIndex(cellIndexRaw, "cell index"),
+    save: args.includes("--save")
   };
 }
 
@@ -584,11 +601,108 @@ function parseExecutionOptions(args, startIndex) {
 
 function parseRunCellArgs(args) {
   const { target, cellIndex } = parseNotebookAndIndexArgs("run-cell", args);
+  const text = args.includes("--text");
+  const filteredArgs = args.filter((a) => a !== "--text");
   return {
     target,
     cellIndex,
-    ...parseExecutionOptions(args, 2)
+    text,
+    ...parseExecutionOptions(filteredArgs, 2)
   };
+}
+
+function parseReplaceAndRunArgs(args) {
+  const target = args[0];
+  const cellIndexRaw = args[1];
+
+  if (!target) {
+    throw createCliError("invalid_argument", "Missing notebook URI or path for `replace-and-run`.");
+  }
+
+  if (cellIndexRaw === undefined) {
+    throw createCliError("invalid_argument", "Missing cell index for `replace-and-run`.");
+  }
+
+  const cellIndex = parseCellIndex(cellIndexRaw, "cell index");
+  let source;
+  let timeoutMs = 30000;
+  let save = false;
+  let print = false;
+
+  for (let index = 2; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (arg === "--text") {
+      index += 1;
+      if (index >= args.length) {
+        throw createCliError("invalid_argument", "Missing value after `--text`.");
+      }
+      source = args[index];
+      continue;
+    }
+
+    if (arg === "--file") {
+      index += 1;
+      if (index >= args.length) {
+        throw createCliError("invalid_argument", "Missing path after `--file`.");
+      }
+      source = readSourceFile(args[index]);
+      continue;
+    }
+
+    if (arg === "--timeout-ms") {
+      index += 1;
+      if (index >= args.length) {
+        throw createCliError("invalid_argument", "Missing value after `--timeout-ms`.");
+      }
+      const value = Number.parseInt(args[index], 10);
+      if (!Number.isInteger(value) || value <= 0) {
+        throw createCliError("invalid_argument", `Invalid timeout in ms: ${args[index]}`, { value: args[index] });
+      }
+      timeoutMs = value;
+      continue;
+    }
+
+    if (arg === "--save") {
+      save = true;
+      continue;
+    }
+
+    if (arg === "--print") {
+      print = true;
+      continue;
+    }
+
+    throw createCliError("invalid_argument", `Unknown argument for \`replace-and-run\`: ${arg}`, { argument: arg });
+  }
+
+  if (source === undefined) {
+    throw createCliError("invalid_argument", "Missing replacement content. Use `--text` or `--file`.");
+  }
+
+  return { target, cellIndex, source, save, print, timeout_ms: timeoutMs };
+}
+
+function printCellOutputsAsText(cell) {
+  const parts = [];
+  for (const output of cell.outputs || []) {
+    for (const item of output.items || []) {
+      if (item.format === "text") {
+        parts.push(item.text);
+      } else if (item.format === "json" && item.mime === "application/vnd.code.notebook.error") {
+        const err = item.json;
+        const name = err.ename || err.name || "Error";
+        const msg = err.evalue || err.message || "";
+        parts.push(`${name}: ${msg}\n`);
+        const tb = err.traceback;
+        if (Array.isArray(tb)) {
+          // Strip ANSI escape codes from Jupyter traceback lines
+          parts.push(tb.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n") + "\n");
+        }
+      }
+    }
+  }
+  return parts.join("");
 }
 
 function parseRunAllArgs(args) {
@@ -676,24 +790,52 @@ async function runCommand(command, args) {
   }
 
   if (command === "replace-cell") {
-    const { target, cellIndex, source } = parseReplaceCellArgs(args);
+    const { target, cellIndex, source, save } = parseReplaceCellArgs(args);
     const data = await requestJson(state, "/replace-cell", {
       ...normalizeNotebookTarget(target),
       cell_index: cellIndex,
-      source
+      source,
+      save
     });
     success(command, data);
     return;
   }
 
   if (command === "run-cell") {
-    const { target, cellIndex, wait, timeout_ms } = parseRunCellArgs(args);
+    const { target, cellIndex, wait, timeout_ms, text } = parseRunCellArgs(args);
     const data = await requestJson(state, "/run-cell", {
       ...normalizeNotebookTarget(target),
       cell_index: cellIndex,
       wait,
       timeout_ms
     });
+    if (text) {
+      if (data.cell?.execution_summary?.success === false) {
+        process.stderr.write("execution failed\n");
+      }
+      process.stdout.write(printCellOutputsAsText(data.cell));
+      return;
+    }
+    success(command, data);
+    return;
+  }
+
+  if (command === "replace-and-run") {
+    const { target, cellIndex, source, save, print, timeout_ms } = parseReplaceAndRunArgs(args);
+    const data = await requestJson(state, "/replace-and-run", {
+      ...normalizeNotebookTarget(target),
+      cell_index: cellIndex,
+      source,
+      save,
+      timeout_ms
+    });
+    if (print) {
+      if (data.cell?.execution_summary?.success === false) {
+        process.stderr.write("execution failed\n");
+      }
+      process.stdout.write(printCellOutputsAsText(data.cell));
+      return;
+    }
     success(command, data);
     return;
   }
@@ -710,23 +852,25 @@ async function runCommand(command, args) {
   }
 
   if (command === "add-cell") {
-    const { target, cellIndex, kind, language, source } = parseAddCellArgs(args);
+    const { target, cellIndex, kind, language, source, save } = parseAddCellArgs(args);
     const data = await requestJson(state, "/add-cell", {
       ...normalizeNotebookTarget(target),
       cell_index: cellIndex,
       kind,
       language,
-      source
+      source,
+      save
     });
     success(command, data);
     return;
   }
 
   if (command === "delete-cell") {
-    const { target, cellIndex } = parseNotebookAndIndexArgs("delete-cell", args);
+    const { target, cellIndex, save } = parseNotebookAndIndexArgs("delete-cell", args);
     const data = await requestJson(state, "/delete-cell", {
       ...normalizeNotebookTarget(target),
-      cell_index: cellIndex
+      cell_index: cellIndex,
+      save
     });
     success(command, data);
     return;
