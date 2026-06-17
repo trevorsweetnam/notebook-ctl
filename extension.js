@@ -146,6 +146,44 @@ function toCellOutputsInfo(cell, index) {
   };
 }
 
+function findNotebookErrors(notebook) {
+  const errors = [];
+
+  for (let index = 0; index < notebook.cellCount; index += 1) {
+    const cell = notebook.cellAt(index);
+    if (cell.kind !== vscode.NotebookCellKind.Code) {
+      continue;
+    }
+
+    const summary = cell.executionSummary;
+    if (!summary || summary.success !== false) {
+      continue;
+    }
+
+    let errorDetail = null;
+    outer: for (const output of cell.outputs) {
+      for (const item of output.items) {
+        if (item.mime === "application/vnd.code.notebook.error") {
+          try {
+            errorDetail = JSON.parse(Buffer.from(item.data).toString("utf8"));
+          } catch {
+            // leave errorDetail null
+          }
+          break outer;
+        }
+      }
+    }
+
+    errors.push({
+      cell_index: index,
+      source: cell.document.getText(),
+      error: errorDetail
+    });
+  }
+
+  return errors;
+}
+
 function isNotebookVisible(notebook) {
   return vscode.window.visibleNotebookEditors.some(
     (editor) => editor.notebook.uri.toString() === notebook.uri.toString()
@@ -321,7 +359,7 @@ async function runNotebookCell(notebook, cellIndex, waitForChange, timeoutMs, si
   const cell = getCellOrThrow(notebook, cellIndex);
   const before = snapshotCellState(cell);
 
-  await getOrEnsureNotebookEditor(notebook);
+  // await getOrEnsureNotebookEditor(notebook);
   await vscode.commands.executeCommand("notebook.cell.execute", {
     document: notebook.uri,
     ranges: [{ start: cellIndex, end: cellIndex + 1 }]
@@ -347,7 +385,7 @@ async function runNotebookCell(notebook, cellIndex, waitForChange, timeoutMs, si
 async function runNotebookAll(notebook, waitForChange, timeoutMs, signal) {
   const before = snapshotNotebookState(notebook);
 
-  await getOrEnsureNotebookEditor(notebook);
+  // await getOrEnsureNotebookEditor(notebook);
   await vscode.commands.executeCommand("notebook.execute", notebook.uri);
 
   if (waitForChange) {
@@ -682,6 +720,50 @@ async function handleRequest(req, res, token, outputChannel, logger) {
 
     await deleteNotebookCell(notebook, body.cell_index, Boolean(body.save));
     loggedSendJson(res, 200, toNotebookDetail(notebook));
+    return;
+  }
+
+  if (req.url === "/find-error") {
+    const notebook = findOpenNotebook([body.notebook_uri, body.file_path]);
+    if (!notebook) {
+      loggedSendJson(res, 404, { error: "Notebook is not open in VS Code." });
+      return;
+    }
+
+    const errors = findNotebookErrors(notebook);
+    loggedSendJson(res, 200, {
+      notebook_uri: notebook.uri.toString(),
+      file_path: notebook.uri.fsPath,
+      error_count: errors.length,
+      first_error: errors[0] ?? null
+    });
+    return;
+  }
+
+  if (req.url === "/new-notebook") {
+    let notebook;
+
+    if (body.file_path) {
+      const uri = vscode.Uri.file(path.resolve(body.file_path));
+      try {
+        await vscode.workspace.fs.stat(uri);
+        loggedSendJson(res, 400, { error: `File already exists: ${body.file_path}` });
+        return;
+      } catch {
+        // Expected: file doesn't exist yet
+      }
+      const content = JSON.stringify({ cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 }, null, 1);
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf8"));
+      notebook = await vscode.workspace.openNotebookDocument(uri);
+    } else {
+      notebook = await vscode.workspace.openNotebookDocument(
+        "jupyter-notebook",
+        new vscode.NotebookData([])
+      );
+    }
+
+    await vscode.window.showNotebookDocument(notebook, { preserveFocus: true, preview: false });
+    loggedSendJson(res, 200, toNotebookSummary(notebook));
     return;
   }
 

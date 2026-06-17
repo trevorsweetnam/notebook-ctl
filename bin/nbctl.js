@@ -35,6 +35,8 @@ function usage() {
   nbctl replace-and-run <notebook-uri-or-path> <cell-index> (--text <text> | --file <path>) [--timeout-ms <ms>] [--save] [--print]
   nbctl add-cell <notebook-uri-or-path> <insert-index> --kind <code|markdown> [--language <id>] (--text <text> | --file <path>) [--save]
   nbctl delete-cell <notebook-uri-or-path> <cell-index> [--save]
+  nbctl find-error <notebook-uri-or-path>
+  nbctl new-notebook [--path <file-path>]
   nbctl bootstrap
   nbctl doctor
   nbctl status
@@ -478,10 +480,11 @@ function parseReplaceCellArgs(args) {
   }
 
   const save = args.includes("--save");
+  const filteredArgs = args.filter((a) => a !== "--save");
   return {
     target,
     cellIndex: parseCellIndex(cellIndexRaw, "cell index"),
-    source: parseSourceOption(args, 2),
+    source: parseSourceOption(filteredArgs, 2),
     save
   };
 }
@@ -873,6 +876,24 @@ async function runCommand(command, args) {
       cell_index: cellIndex,
       save
     });
+    success(command, data);
+    return;
+  }
+
+  if (command === "find-error") {
+    const target = parseNotebookTargetArg("find-error", args);
+    const data = await requestJson(state, "/find-error", normalizeNotebookTarget(target));
+    success(command, data);
+    return;
+  }
+
+  if (command === "new-notebook") {
+    const pathIndex = args.indexOf("--path");
+    const filePath = pathIndex !== -1 ? args[pathIndex + 1] : undefined;
+    if (pathIndex !== -1 && !filePath) {
+      throw createCliError("invalid_argument", "Missing value after `--path`.");
+    }
+    const data = await requestJson(state, "/new-notebook", filePath ? { file_path: filePath } : {});
     success(command, data);
     return;
   }
