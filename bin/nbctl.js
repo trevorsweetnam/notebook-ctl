@@ -24,23 +24,33 @@ function defaultStateFilePath() {
 function usage() {
   return `Usage:
   nbctl list-open
-  nbctl inspect <notebook-uri-or-path>
-  nbctl list-cells <notebook-uri-or-path>   (alias for inspect)
-  nbctl get <notebook-uri-or-path>
-  nbctl get-cell <notebook-uri-or-path> <cell-index>
-  nbctl get-outputs <notebook-uri-or-path> <cell-index>
-  nbctl run-cell <notebook-uri-or-path> <cell-index> [--wait] [--timeout-ms <ms>] [--text]
+  nbctl inspect <notebook-uri-or-path>         compact summary: kind, preview, lengths, mime types
+  nbctl list-cells <notebook-uri-or-path>      (alias for inspect)
+  nbctl get <notebook-uri-or-path>             full content: all source and outputs for every cell
+  nbctl get-cell <notebook-uri-or-path> <cell-index-or-id>
+  nbctl get-outputs <notebook-uri-or-path> <cell-index-or-id> [--print]
+  nbctl run-cell <notebook-uri-or-path> <cell-index-or-id> [--wait] [--timeout-ms <ms>] [--print]
+                                               (without --wait, outputs in the response are from the previous run)
   nbctl run-all <notebook-uri-or-path> [--wait] [--timeout-ms <ms>]
-  nbctl replace-cell <notebook-uri-or-path> <cell-index> (--text <text> | --file <path>) [--save]
-  nbctl replace-and-run <notebook-uri-or-path> <cell-index> (--text <text> | --file <path>) [--timeout-ms <ms>] [--save] [--print]
+  nbctl replace-cell <notebook-uri-or-path> <cell-index-or-id> (--text <text> | --file <path>) [--save]
+  nbctl patch-cell <notebook-uri-or-path> <cell-index-or-id> --old-file <path> --new-file <path> [--save]
+  nbctl replace-and-run <notebook-uri-or-path> <cell-index-or-id> (--text <text> | --file <path>) [--timeout-ms <ms>] [--save] [--print]
+                                               (always waits for completion)
   nbctl add-cell <notebook-uri-or-path> <insert-index> --kind <code|markdown> [--language <id>] (--text <text> | --file <path>) [--save]
-  nbctl delete-cell <notebook-uri-or-path> <cell-index> [--save]
-  nbctl find-error <notebook-uri-or-path>
+  nbctl delete-cell <notebook-uri-or-path> <cell-index-or-id> [--save]
+  nbctl find-error <notebook-uri-or-path> [--all]
   nbctl new-notebook [--path <file-path>]
   nbctl bootstrap
   nbctl doctor
   nbctl status
   nbctl help
+
+Flags:
+  --print    Print cell outputs as plain text (get-outputs, run-cell, replace-and-run)
+  --text     Provide cell source content inline (replace-cell, add-cell, replace-and-run)
+  --file     Provide cell source content from a file path (same commands as --text)
+  --save     Persist the notebook to disk after the operation
+  --wait     Block until cell execution completes and outputs are ready
 
 Environment:
   NBCTL_STATE_FILE   Override the bridge state file path.
@@ -403,6 +413,18 @@ function parseCellIndex(rawValue, label) {
   return value;
 }
 
+// Returns {cell_index: N} for pure-integer args, {cell_id: "..."} for everything else.
+// This lets callers use either positional index or the notebook's stable cell UUID.
+function parseCellRef(rawValue, label) {
+  if (/^\d+$/.test(rawValue)) {
+    return { cell_index: parseCellIndex(rawValue, label) };
+  }
+  if (!rawValue) {
+    throw createCliError("invalid_argument", `Missing ${label}.`);
+  }
+  return { cell_id: rawValue };
+}
+
 function readSourceFile(filePath) {
   if (filePath === "-") {
     try {
@@ -483,10 +505,95 @@ function parseReplaceCellArgs(args) {
   const filteredArgs = args.filter((a) => a !== "--save");
   return {
     target,
-    cellIndex: parseCellIndex(cellIndexRaw, "cell index"),
+    cellRef: parseCellRef(cellIndexRaw, "cell index"),
     source: parseSourceOption(filteredArgs, 2),
     save
   };
+}
+
+function parsePatchCellArgs(args) {
+  const target = args[0];
+  const cellIndexRaw = args[1];
+
+  if (!target) {
+    throw createCliError("invalid_argument", "Missing notebook URI or path for `patch-cell`.");
+  }
+
+  if (cellIndexRaw === undefined) {
+    throw createCliError("invalid_argument", "Missing cell index for `patch-cell`.");
+  }
+
+  const cellRef = parseCellRef(cellIndexRaw, "cell index");
+  let oldFile;
+  let newFile;
+  let save = false;
+
+  for (let index = 2; index < args.length; index += 1) {
+    const arg = args[index];
+
+    if (arg === "--old-file") {
+      index += 1;
+      if (index >= args.length) {
+        throw createCliError("invalid_argument", "Missing path after `--old-file`.");
+      }
+      oldFile = args[index];
+      continue;
+    }
+
+    if (arg === "--new-file") {
+      index += 1;
+      if (index >= args.length) {
+        throw createCliError("invalid_argument", "Missing path after `--new-file`.");
+      }
+      newFile = args[index];
+      continue;
+    }
+
+    if (arg === "--save") {
+      save = true;
+      continue;
+    }
+
+    throw createCliError("invalid_argument", `Unknown argument for \`patch-cell\`: ${arg}`, { argument: arg });
+  }
+
+  if (oldFile === undefined) {
+    throw createCliError("invalid_argument", "Missing `--old-file`.");
+  }
+
+  if (newFile === undefined) {
+    throw createCliError("invalid_argument", "Missing `--new-file`.");
+  }
+
+  return {
+    target,
+    cellRef,
+    oldSource: readSourceFile(oldFile),
+    newSource: readSourceFile(newFile),
+    save
+  };
+}
+
+function applyPatch(cellSource, oldSource, newSource) {
+  const firstIndex = cellSource.indexOf(oldSource);
+  if (firstIndex === -1) {
+    throw createCliError(
+      "patch_not_found",
+      "The old-file content was not found in the cell source.",
+      { old_source: oldSource }
+    );
+  }
+
+  const secondIndex = cellSource.indexOf(oldSource, firstIndex + 1);
+  if (secondIndex !== -1) {
+    throw createCliError(
+      "patch_ambiguous",
+      "The old-file content matches more than once in the cell source — it must be unique.",
+      { old_source: oldSource }
+    );
+  }
+
+  return cellSource.slice(0, firstIndex) + newSource + cellSource.slice(firstIndex + oldSource.length);
 }
 
 function parseAddCellArgs(args) {
@@ -564,7 +671,7 @@ function parseNotebookAndIndexArgs(command, args) {
 
   return {
     target,
-    cellIndex: parseCellIndex(cellIndexRaw, "cell index"),
+    cellRef: parseCellRef(cellIndexRaw, "cell index"),
     save: args.includes("--save")
   };
 }
@@ -604,12 +711,12 @@ function parseExecutionOptions(args, startIndex) {
 }
 
 function parseRunCellArgs(args) {
-  const { target, cellIndex } = parseNotebookAndIndexArgs("run-cell", args);
-  const text = args.includes("--text");
-  const filteredArgs = args.filter((a) => a !== "--text");
+  const { target, cellRef } = parseNotebookAndIndexArgs("run-cell", args);
+  const text = args.includes("--print");
+  const filteredArgs = args.filter((a) => a !== "--print");
   return {
     target,
-    cellIndex,
+    cellRef,
     text,
     ...parseExecutionOptions(filteredArgs, 2)
   };
@@ -627,7 +734,7 @@ function parseReplaceAndRunArgs(args) {
     throw createCliError("invalid_argument", "Missing cell index for `replace-and-run`.");
   }
 
-  const cellIndex = parseCellIndex(cellIndexRaw, "cell index");
+  const cellRef = parseCellRef(cellIndexRaw, "cell index");
   let source;
   let timeoutMs = 30000;
   let save = false;
@@ -684,7 +791,7 @@ function parseReplaceAndRunArgs(args) {
     throw createCliError("invalid_argument", "Missing replacement content. Use `--text` or `--file`.");
   }
 
-  return { target, cellIndex, source, save, print, timeout_ms: timeoutMs };
+  return { target, cellRef, source, save, print, timeout_ms: timeoutMs };
 }
 
 function printCellOutputsAsText(cell) {
@@ -774,30 +881,38 @@ async function runCommand(command, args) {
   }
 
   if (command === "get-cell") {
-    const { target, cellIndex } = parseNotebookAndIndexArgs("get-cell", args);
+    const { target, cellRef } = parseNotebookAndIndexArgs("get-cell", args);
     const data = await requestJson(state, "/get-cell", {
       ...normalizeNotebookTarget(target),
-      cell_index: cellIndex
+      ...cellRef
     });
     success(command, data);
     return;
   }
 
   if (command === "get-outputs") {
-    const { target, cellIndex } = parseNotebookAndIndexArgs("get-outputs", args);
+    const { target, cellRef } = parseNotebookAndIndexArgs("get-outputs", args);
+    const print = args.includes("--print");
     const data = await requestJson(state, "/get-outputs", {
       ...normalizeNotebookTarget(target),
-      cell_index: cellIndex
+      ...cellRef
     });
+    if (print) {
+      if (data.cell?.execution_summary?.success === false) {
+        process.stderr.write("execution failed\n");
+      }
+      process.stdout.write(printCellOutputsAsText(data.cell));
+      return;
+    }
     success(command, data);
     return;
   }
 
   if (command === "replace-cell") {
-    const { target, cellIndex, source, save } = parseReplaceCellArgs(args);
+    const { target, cellRef, source, save } = parseReplaceCellArgs(args);
     const data = await requestJson(state, "/replace-cell", {
       ...normalizeNotebookTarget(target),
-      cell_index: cellIndex,
+      ...cellRef,
       source,
       save
     });
@@ -805,11 +920,29 @@ async function runCommand(command, args) {
     return;
   }
 
+  if (command === "patch-cell") {
+    const { target, cellRef, oldSource, newSource, save } = parsePatchCellArgs(args);
+    const cellData = await requestJson(state, "/get-cell", {
+      ...normalizeNotebookTarget(target),
+      ...cellRef
+    });
+    const currentSource = cellData.cell?.source ?? cellData.source ?? "";
+    const patchedSource = applyPatch(currentSource, oldSource, newSource);
+    const data = await requestJson(state, "/replace-cell", {
+      ...normalizeNotebookTarget(target),
+      ...cellRef,
+      source: patchedSource,
+      save
+    });
+    success(command, data);
+    return;
+  }
+
   if (command === "run-cell") {
-    const { target, cellIndex, wait, timeout_ms, text } = parseRunCellArgs(args);
+    const { target, cellRef, wait, timeout_ms, text } = parseRunCellArgs(args);
     const data = await requestJson(state, "/run-cell", {
       ...normalizeNotebookTarget(target),
-      cell_index: cellIndex,
+      ...cellRef,
       wait,
       timeout_ms
     });
@@ -825,10 +958,10 @@ async function runCommand(command, args) {
   }
 
   if (command === "replace-and-run") {
-    const { target, cellIndex, source, save, print, timeout_ms } = parseReplaceAndRunArgs(args);
+    const { target, cellRef, source, save, print, timeout_ms } = parseReplaceAndRunArgs(args);
     const data = await requestJson(state, "/replace-and-run", {
       ...normalizeNotebookTarget(target),
-      cell_index: cellIndex,
+      ...cellRef,
       source,
       save,
       timeout_ms
@@ -870,10 +1003,10 @@ async function runCommand(command, args) {
   }
 
   if (command === "delete-cell") {
-    const { target, cellIndex, save } = parseNotebookAndIndexArgs("delete-cell", args);
+    const { target, cellRef, save } = parseNotebookAndIndexArgs("delete-cell", args);
     const data = await requestJson(state, "/delete-cell", {
       ...normalizeNotebookTarget(target),
-      cell_index: cellIndex,
+      ...cellRef,
       save
     });
     success(command, data);
@@ -882,8 +1015,23 @@ async function runCommand(command, args) {
 
   if (command === "find-error") {
     const target = parseNotebookTargetArg("find-error", args);
+    const all = args.includes("--all");
     const data = await requestJson(state, "/find-error", normalizeNotebookTarget(target));
-    success(command, data);
+    if (all) {
+      success(command, {
+        notebook_uri: data.notebook_uri,
+        file_path: data.file_path,
+        error_count: data.error_count,
+        errors: data.errors
+      });
+      return;
+    }
+    success(command, {
+      notebook_uri: data.notebook_uri,
+      file_path: data.file_path,
+      error_count: data.error_count,
+      first_error: data.first_error
+    });
     return;
   }
 

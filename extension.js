@@ -115,6 +115,7 @@ function toExecutionSummary(cell) {
 function toCellInfo(cell, index) {
   return {
     id: `c${index}`,
+    notebook_cell_id: cell.metadata?.id ?? null,
     index,
     kind: cell.kind === vscode.NotebookCellKind.Markup ? "markdown" : "code",
     language: cell.document.languageId,
@@ -127,6 +128,7 @@ function toCellInfo(cell, index) {
 function toCellSourceInfo(cell, index) {
   return {
     id: `c${index}`,
+    notebook_cell_id: cell.metadata?.id ?? null,
     index,
     kind: cell.kind === vscode.NotebookCellKind.Markup ? "markdown" : "code",
     language: cell.document.languageId,
@@ -138,6 +140,7 @@ function toCellSourceInfo(cell, index) {
 function toCellOutputsInfo(cell, index) {
   return {
     id: `c${index}`,
+    notebook_cell_id: cell.metadata?.id ?? null,
     index,
     kind: cell.kind === vscode.NotebookCellKind.Markup ? "markdown" : "code",
     language: cell.document.languageId,
@@ -175,6 +178,8 @@ function findNotebookErrors(notebook) {
     }
 
     errors.push({
+      id: `c${index}`,
+      notebook_cell_id: cell.metadata?.id ?? null,
       cell_index: index,
       source: cell.document.getText(),
       error: errorDetail
@@ -241,11 +246,12 @@ function toNotebookInspection(notebook) {
 }
 
 function toCellListItem(cell, index) {
-  return summarizeCell(
+  const summary = summarizeCell(
     cell,
     index,
     cell.kind === vscode.NotebookCellKind.Markup ? "markdown" : "code"
   );
+  return { ...summary, notebook_cell_id: cell.metadata?.id ?? null };
 }
 
 function findOpenNotebook(targets) {
@@ -357,6 +363,18 @@ function waitForNotebookMutation(notebook, hasChanged, timeoutMs, signal) {
 
 async function runNotebookCell(notebook, cellIndex, waitForChange, timeoutMs, signal) {
   const cell = getCellOrThrow(notebook, cellIndex);
+
+  if (cell.kind === vscode.NotebookCellKind.Markup) {
+    return {
+      notebook_uri: notebook.uri.toString(),
+      file_path: notebook.uri.fsPath,
+      waited: false,
+      skipped: true,
+      skip_reason: "markdown",
+      cell: toCellOutputsInfo(cell, cellIndex)
+    };
+  }
+
   const before = snapshotCellState(cell);
 
   // await getOrEnsureNotebookEditor(notebook);
@@ -461,6 +479,22 @@ function getCellOrThrow(notebook, cellIndex) {
     throw new Error(`Cell index ${cellIndex} is out of range for notebook with ${notebook.cellCount} cells.`);
   }
   return notebook.cellAt(cellIndex);
+}
+
+function resolveCellIndex(notebook, body) {
+  if (typeof body.cell_id === "string") {
+    for (let i = 0; i < notebook.cellCount; i += 1) {
+      if (notebook.cellAt(i).metadata?.id === body.cell_id) {
+        return i;
+      }
+    }
+    throw new Error(`No cell with id "${body.cell_id}" found in the notebook.`);
+  }
+  const index = body.cell_index;
+  if (!Number.isInteger(index) || index < 0 || index >= notebook.cellCount) {
+    throw new Error(`Cell index ${index} is out of range for notebook with ${notebook.cellCount} cells.`);
+  }
+  return index;
 }
 
 async function addNotebookCell(notebook, cellIndex, kind, language, source, save = false) {
@@ -577,11 +611,11 @@ async function handleRequest(req, res, token, outputChannel, logger) {
       return;
     }
 
-    const cell = getCellOrThrow(notebook, body.cell_index);
+    const cellIndex = resolveCellIndex(notebook, body);
     loggedSendJson(res, 200, {
       notebook_uri: notebook.uri.toString(),
       file_path: notebook.uri.fsPath,
-      cell: toCellSourceInfo(cell, body.cell_index)
+      cell: toCellSourceInfo(notebook.cellAt(cellIndex), cellIndex)
     });
     return;
   }
@@ -593,11 +627,11 @@ async function handleRequest(req, res, token, outputChannel, logger) {
       return;
     }
 
-    const cell = getCellOrThrow(notebook, body.cell_index);
+    const cellIndex = resolveCellIndex(notebook, body);
     loggedSendJson(res, 200, {
       notebook_uri: notebook.uri.toString(),
       file_path: notebook.uri.fsPath,
-      cell: toCellOutputsInfo(cell, body.cell_index)
+      cell: toCellOutputsInfo(notebook.cellAt(cellIndex), cellIndex)
     });
     return;
   }
@@ -614,12 +648,12 @@ async function handleRequest(req, res, token, outputChannel, logger) {
       return;
     }
 
-    await replaceNotebookCellSource(notebook, body.cell_index, body.source, Boolean(body.save));
-    const replacedCell = getCellOrThrow(notebook, body.cell_index);
+    const cellIndex = resolveCellIndex(notebook, body);
+    await replaceNotebookCellSource(notebook, cellIndex, body.source, Boolean(body.save));
     loggedSendJson(res, 200, {
       notebook_uri: notebook.uri.toString(),
       file_path: notebook.uri.fsPath,
-      cell: toCellSourceInfo(replacedCell, body.cell_index)
+      cell: toCellSourceInfo(notebook.cellAt(cellIndex), cellIndex)
     });
     return;
   }
@@ -636,12 +670,13 @@ async function handleRequest(req, res, token, outputChannel, logger) {
       return;
     }
 
-    await replaceNotebookCellSource(notebook, body.cell_index, body.source, Boolean(body.save));
+    const cellIndex = resolveCellIndex(notebook, body);
+    await replaceNotebookCellSource(notebook, cellIndex, body.source, Boolean(body.save));
     const ac = new AbortController();
     req.on("close", () => ac.abort());
     const result = await runNotebookCell(
       notebook,
-      body.cell_index,
+      cellIndex,
       true,
       Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000,
       ac.signal
@@ -657,11 +692,12 @@ async function handleRequest(req, res, token, outputChannel, logger) {
       return;
     }
 
+    const cellIndex = resolveCellIndex(notebook, body);
     const ac = new AbortController();
     req.on("close", () => ac.abort());
     const result = await runNotebookCell(
       notebook,
-      body.cell_index,
+      cellIndex,
       Boolean(body.wait),
       Number.isInteger(body.timeout_ms) ? body.timeout_ms : 30000,
       ac.signal
@@ -707,7 +743,13 @@ async function handleRequest(req, res, token, outputChannel, logger) {
     }
 
     await addNotebookCell(notebook, body.cell_index, body.kind, body.language, body.source, Boolean(body.save));
-    loggedSendJson(res, 200, toNotebookDetail(notebook));
+    const newCell = notebook.cellAt(body.cell_index);
+    loggedSendJson(res, 200, {
+      notebook_uri: notebook.uri.toString(),
+      file_path: notebook.uri.fsPath,
+      cell_count: notebook.cellCount,
+      cell: toCellSourceInfo(newCell, body.cell_index)
+    });
     return;
   }
 
@@ -718,8 +760,14 @@ async function handleRequest(req, res, token, outputChannel, logger) {
       return;
     }
 
-    await deleteNotebookCell(notebook, body.cell_index, Boolean(body.save));
-    loggedSendJson(res, 200, toNotebookDetail(notebook));
+    const cellIndex = resolveCellIndex(notebook, body);
+    await deleteNotebookCell(notebook, cellIndex, Boolean(body.save));
+    loggedSendJson(res, 200, {
+      notebook_uri: notebook.uri.toString(),
+      file_path: notebook.uri.fsPath,
+      cell_count: notebook.cellCount,
+      deleted_cell_index: cellIndex
+    });
     return;
   }
 
@@ -735,7 +783,8 @@ async function handleRequest(req, res, token, outputChannel, logger) {
       notebook_uri: notebook.uri.toString(),
       file_path: notebook.uri.fsPath,
       error_count: errors.length,
-      first_error: errors[0] ?? null
+      first_error: errors[0] ?? null,
+      errors
     });
     return;
   }
