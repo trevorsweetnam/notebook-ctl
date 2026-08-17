@@ -99,7 +99,11 @@ nbctl get /absolute/path/to/notebook.ipynb
 nbctl get file:///absolute/path/to/notebook.ipynb
 ```
 
-The extension writes bridge state to `~/.notebook-bridge/state.json` and also writes a fallback `.nbctl-state.json` beside the installed extension. The CLI discovers those automatically from any working directory. If needed, override it with `NBCTL_STATE_FILE=/path/to/state.json`.
+The extension writes bridge state to `~/.notebook-bridge/state.json` and also writes a fallback `.nbctl-state.json` beside the installed extension. Each running VS Code window registers itself as its own entry in that file (keyed by process id), so multiple windows can be open at once without clobbering or breaking each other. The CLI discovers those automatically from any working directory. If needed, override the file with `NBCTL_STATE_FILE=/path/to/state.json`.
+
+### Multiple Windows
+
+When more than one VS Code window is open, `nbctl` automatically routes notebook-targeted commands (`get`, `inspect`, `run-cell`, etc.) to whichever window actually has that notebook open, by probing each running window's `/list-open` endpoint. If the same notebook is somehow open in more than one window, the most recently focused window wins. Set `NBCTL_INSTANCE_PID=<pid>` (see `nbctl status` for pids) to force routing to a specific window instead.
 
 If `nbctl status` reports `bridge_not_available`, run:
 
@@ -117,10 +121,23 @@ All CLI responses are JSON. Success responses look like:
   "ok": true,
   "command": "list-open",
   "data": {
-    "notebooks": []
+    "windows": [
+      {
+        "pid": 1234,
+        "port": 54871,
+        "workspace_folders": ["/Users/you/project"],
+        "focused_at": "2026-08-17T09:00:00.000Z",
+        "updated_at": "2026-08-17T09:00:00.000Z",
+        "reachable": true,
+        "notebooks": [],
+        "error": null
+      }
+    ]
   }
 }
 ```
+
+`data.windows` has one entry per running VS Code window; each entry's `notebooks` array uses the same shape as before.
 
 Failures also return JSON and exit non-zero:
 
@@ -145,7 +162,7 @@ Use `examples/smoke-test.ipynb` as the manual test notebook.
 
 Expected result:
 
-- `list-open` returns one entry for `examples/smoke-test.ipynb` if it is the only visible notebook editor.
+- `list-open` returns one window (your VS Code process) whose `notebooks` array has one entry for `examples/smoke-test.ipynb` if it is the only visible notebook editor.
 - `get` returns notebook metadata plus four cells, including markdown, multiline code, and an empty code cell.
 
 ## Commands

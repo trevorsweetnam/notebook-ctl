@@ -1,42 +1,11 @@
 const crypto = require("crypto");
-const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
 const vscode = require("vscode");
 const { summarizeCell } = require("./lib/notebook-inspection");
 const { createLogger } = require("./lib/logger");
-
-function stateFilePath() {
-  return path.join(os.homedir(), ".notebook-bridge", "state.json");
-}
-
-function workspaceStateFilePath() {
-  return path.join(__dirname, ".nbctl-state.json");
-}
-
-function stateFilePaths() {
-  return [stateFilePath(), workspaceStateFilePath()];
-}
-
-function writeStateFiles(state, outputChannel) {
-  const written = [];
-  for (const filePath of stateFilePaths()) {
-    try {
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      fs.writeFileSync(filePath, JSON.stringify(state, null, 2));
-      written.push(filePath);
-    } catch (error) {
-      outputChannel.appendLine(`Failed to write state file at ${filePath}: ${error.message}`);
-    }
-  }
-
-  if (written.length === 0) {
-    throw new Error("Notebook Bridge could not write any state files.");
-  }
-
-  return written;
-}
+const registry = require("./lib/instance-registry");
 
 function decodeOutputItemData(item) {
   const mime = item.mime;
@@ -844,25 +813,53 @@ async function activate(context) {
     throw new Error("Notebook Bridge failed to bind a localhost port.");
   }
 
-  const state = {
-    extension_path: __dirname,
-    port: address.port,
-    token,
-    log_file: logFile,
-    state_file: stateFilePath(),
-    state_files: stateFilePaths(),
-    updated_at: new Date().toISOString()
-  };
+  const pid = process.pid;
+  const workspaceFolders = (vscode.workspace.workspaceFolders || []).map((folder) => folder.uri.fsPath);
 
-  const writtenStateFiles = writeStateFiles(state, outputChannel);
-  outputChannel.appendLine(`Notebook Bridge listening on http://127.0.0.1:${address.port}`);
+  function buildOwnRecord() {
+    return {
+      pid,
+      port: address.port,
+      token,
+      extension_path: __dirname,
+      log_file: logFile,
+      workspace_folders: workspaceFolders,
+      focused_at: vscode.window.state.focused ? new Date().toISOString() : null,
+      updated_at: new Date().toISOString()
+    };
+  }
+
+  function persistOwnRecord() {
+    const existing = registry.pruneDeadInstances(registry.loadInstances());
+    const next = registry.upsertInstance(existing, buildOwnRecord());
+    const { written, errors } = registry.writeInstances(next);
+    if (written.length === 0) {
+      throw new Error(`Notebook Bridge could not write any state files: ${errors.join(", ")}`);
+    }
+    return written;
+  }
+
+  const writtenStateFiles = persistOwnRecord();
+  outputChannel.appendLine(`Notebook Bridge listening on http://127.0.0.1:${address.port} (pid ${pid})`);
   outputChannel.appendLine(`State files: ${writtenStateFiles.join(", ")}`);
   outputChannel.appendLine(`Log file: ${logFile}`);
-  logger.info(`Server started on port ${address.port} state=${writtenStateFiles[0]}`);
+  logger.info(`Server started on port ${address.port} pid=${pid} state=${registry.primaryStatePath()}`);
+
+  const focusSubscription = vscode.window.onDidChangeWindowState((windowState) => {
+    if (!windowState.focused) {
+      return;
+    }
+    try {
+      persistOwnRecord();
+    } catch (error) {
+      outputChannel.appendLine(`Failed to refresh instance registry on focus: ${error.message}`);
+    }
+  });
+  context.subscriptions.push(focusSubscription);
 
   const showServerInfo = vscode.commands.registerCommand("notebookBridge.showServerInfo", async () => {
     await vscode.window.showInformationMessage(
-      `Notebook Bridge listening on 127.0.0.1:${address.port}. State file: ${writtenStateFiles[0]}`
+      `Notebook Bridge listening on 127.0.0.1:${address.port} (pid ${pid}). State file: ${registry.primaryStatePath()}`
     );
     outputChannel.show(true);
   });
@@ -870,14 +867,12 @@ async function activate(context) {
   context.subscriptions.push(showServerInfo);
   context.subscriptions.push({
     dispose: () => {
-      for (const filePath of writtenStateFiles) {
-        try {
-          fs.unlinkSync(filePath);
-        } catch (error) {
-          if (error.code !== "ENOENT") {
-            outputChannel.appendLine(`Failed to remove state file ${filePath}: ${error.message}`);
-          }
-        }
+      try {
+        const existing = registry.loadInstances();
+        const next = registry.removeInstancePid(existing, pid);
+        registry.writeInstances(next);
+      } catch (error) {
+        outputChannel.appendLine(`Failed to update instance registry on dispose: ${error.message}`);
       }
       server.close();
       outputChannel.dispose();

@@ -2,14 +2,10 @@
 
 const fs = require("fs");
 const http = require("http");
-const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 const { pathToFileURL } = require("url");
-
-const LEGACY_STATE_FILE_PATHS = [
-  path.resolve(__dirname, "..", ".nbctl-state.json")
-];
+const registry = require("../lib/instance-registry");
 
 const CODE_CLI_CANDIDATES = [
   process.env.NBCTL_CODE_CLI,
@@ -17,9 +13,21 @@ const CODE_CLI_CANDIDATES = [
   "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
 ].filter(Boolean);
 
-function defaultStateFilePath() {
-  return path.join(os.homedir(), ".notebook-bridge", "state.json");
-}
+const NOTEBOOK_TARGETED_COMMANDS = new Set([
+  "get",
+  "inspect",
+  "list-cells",
+  "get-cell",
+  "get-outputs",
+  "replace-cell",
+  "patch-cell",
+  "replace-and-run",
+  "run-cell",
+  "run-all",
+  "add-cell",
+  "delete-cell",
+  "find-error"
+]);
 
 function usage() {
   return `Usage:
@@ -53,8 +61,15 @@ Flags:
   --wait     Block until cell execution completes and outputs are ready
 
 Environment:
-  NBCTL_STATE_FILE   Override the bridge state file path.
-  NBCTL_CODE_CLI     Override the VS Code CLI executable used by bootstrap.
+  NBCTL_STATE_FILE    Override the bridge state file path.
+  NBCTL_INSTANCE_PID  Force routing to a specific VS Code window (pid from \`nbctl status\`).
+  NBCTL_CODE_CLI      Override the VS Code CLI executable used by bootstrap.
+
+Multiple windows:
+  When more than one VS Code window is open, notebook-targeted commands (get, inspect,
+  run-cell, etc.) automatically route to whichever window has that notebook open. If the
+  notebook is open in more than one window, the most recently focused window is used.
+  Set NBCTL_INSTANCE_PID to force a specific window instead.
 `;
 }
 
@@ -90,19 +105,6 @@ function success(command, data) {
     command,
     data
   });
-}
-
-function readJsonFile(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
-}
-
-function findStateFilePath() {
-  if (process.env.NBCTL_STATE_FILE) {
-    return process.env.NBCTL_STATE_FILE;
-  }
-
-  const candidates = [defaultStateFilePath()].concat(LEGACY_STATE_FILE_PATHS);
-  return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
 function bundledVsixPath() {
@@ -174,69 +176,160 @@ function bootstrapBridge() {
   };
 }
 
-async function doctor() {
-  const stateFile = findStateFilePath();
-  const result = {
-    state_candidates: [defaultStateFilePath()].concat(LEGACY_STATE_FILE_PATHS),
-    state_file: stateFile || null,
-    state_exists: Boolean(stateFile),
-    code_cli: findCodeCli(),
-    code_cli_candidates: CODE_CLI_CANDIDATES,
-    bundled_vsix: bundledVsixPath(),
-    bundled_vsix_exists: fs.existsSync(bundledVsixPath()),
-    health: null
-  };
-
-  if (stateFile) {
-    try {
-      const state = loadState();
-      result.state = {
-        extension_path: state.extension_path || null,
-        port: state.port || null,
-        log_file: state.log_file || null,
-        updated_at: state.updated_at || null
-      };
-      result.health = await requestJson(state, "/health");
-    } catch (error) {
-      result.health = {
-        ok: false,
-        code: error.code || "unexpected_error",
-        message: error.message,
-        details: error.details || null
-      };
-    }
-  }
-
-  return result;
+function loadLiveInstances() {
+  const statePath = process.env.NBCTL_STATE_FILE || undefined;
+  const raw = registry.loadInstances({ statePath });
+  return registry.pruneDeadInstances(raw);
 }
 
-function loadState() {
-  const stateFile = findStateFilePath();
-  if (!stateFile) {
-    const defaultPath = defaultStateFilePath();
+function requireLiveInstances() {
+  const instances = loadLiveInstances();
+  if (instances.length === 0) {
     throw createCliError(
       "bridge_not_available",
-      "Notebook Bridge state file was not found. Run `nbctl bootstrap`, then reload/open VS Code so the extension can start.",
+      "No running Notebook Bridge instances were found. Run `nbctl bootstrap`, then open/reload VS Code so the extension can start.",
       {
-        looked_in: [defaultPath].concat(LEGACY_STATE_FILE_PATHS),
+        state_candidates: registry.statePaths(),
         env_var: "NBCTL_STATE_FILE",
         bootstrap_command: "nbctl bootstrap",
         diagnostic_command: "nbctl doctor"
       }
     );
   }
+  return instances;
+}
 
-  try {
-    const state = readJsonFile(stateFile);
-    state.state_file = stateFile;
-    return state;
-  } catch (error) {
+function instanceForcedByEnv(instances) {
+  const forcedPidRaw = process.env.NBCTL_INSTANCE_PID;
+  if (!forcedPidRaw) {
+    return null;
+  }
+
+  const forcedPid = Number.parseInt(forcedPidRaw, 10);
+  const found = instances.find((instance) => instance.pid === forcedPid);
+  if (!found) {
     throw createCliError(
-      "invalid_state_file",
-      `Failed to read Notebook Bridge state file at ${stateFile}.`,
-      { state_file: stateFile, reason: error.message }
+      "instance_not_found",
+      `NBCTL_INSTANCE_PID=${forcedPidRaw} does not match any running Notebook Bridge instance.`,
+      {
+        requested_pid: forcedPid,
+        live_pids: instances.map((instance) => instance.pid)
+      }
     );
   }
+  return found;
+}
+
+async function probeInstance(instance) {
+  try {
+    const data = await requestJson(instance, "/list-open", {}, { timeoutMs: 4000 });
+    return { instance, reachable: true, notebooks: data.notebooks || [] };
+  } catch (error) {
+    return { instance, reachable: false, error };
+  }
+}
+
+function describeInstance(instance) {
+  return {
+    pid: instance.pid,
+    port: instance.port,
+    workspace_folders: instance.workspace_folders || [],
+    focused_at: instance.focused_at || null,
+    updated_at: instance.updated_at || null
+  };
+}
+
+function sortByMostRecentlyFocused(entries, getInstance) {
+  return [...entries].sort((a, b) => {
+    const aFocusedAt = getInstance(a).focused_at || "";
+    const bFocusedAt = getInstance(b).focused_at || "";
+    return bFocusedAt.localeCompare(aFocusedAt);
+  });
+}
+
+async function resolveInstanceForTarget(target, instances) {
+  const forced = instanceForcedByEnv(instances);
+  if (forced) {
+    return forced;
+  }
+
+  const normalizedTarget = normalizeNotebookTarget(target);
+  const probes = await Promise.all(instances.map(probeInstance));
+
+  const matches = probes.filter(({ reachable, notebooks }) =>
+    reachable &&
+    notebooks.some((notebook) =>
+      (normalizedTarget.notebook_uri && notebook.notebook_uri === normalizedTarget.notebook_uri) ||
+      (normalizedTarget.file_path && notebook.file_path === normalizedTarget.file_path)
+    )
+  );
+
+  if (matches.length === 0) {
+    throw createCliError(
+      "notebook_not_open",
+      `Notebook is not open in any running VS Code window: ${target}`,
+      {
+        target,
+        checked_instances: probes.map(({ instance, reachable, error }) => ({
+          ...describeInstance(instance),
+          reachable,
+          error: reachable ? null : error.message
+        }))
+      }
+    );
+  }
+
+  const sorted = sortByMostRecentlyFocused(matches, (match) => match.instance);
+  return sorted[0].instance;
+}
+
+function resolveInstanceForNewNotebook(filePath, instances) {
+  const forced = instanceForcedByEnv(instances);
+  if (forced) {
+    return forced;
+  }
+
+  if (filePath) {
+    const absolutePath = path.resolve(filePath);
+    const owning = instances.filter((instance) =>
+      (instance.workspace_folders || []).some((folder) => {
+        const relative = path.relative(folder, absolutePath);
+        return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+      })
+    );
+    if (owning.length > 0) {
+      return sortByMostRecentlyFocused(owning, (instance) => instance)[0];
+    }
+  }
+
+  return sortByMostRecentlyFocused(instances, (instance) => instance)[0];
+}
+
+async function doctor() {
+  const instances = loadLiveInstances();
+  const health = await Promise.all(instances.map(async (instance) => {
+    try {
+      const result = await requestJson(instance, "/health", undefined, { timeoutMs: 4000 });
+      return { ...describeInstance(instance), reachable: true, health: result };
+    } catch (error) {
+      return {
+        ...describeInstance(instance),
+        reachable: false,
+        error: { code: error.code || "unexpected_error", message: error.message }
+      };
+    }
+  }));
+
+  return {
+    state_candidates: registry.statePaths(),
+    instance_count: instances.length,
+    instances: instances.map(describeInstance),
+    code_cli: findCodeCli(),
+    code_cli_candidates: CODE_CLI_CANDIDATES,
+    bundled_vsix: bundledVsixPath(),
+    bundled_vsix_exists: fs.existsSync(bundledVsixPath()),
+    health
+  };
 }
 
 function normalizeNotebookTarget(target) {
@@ -262,17 +355,17 @@ function createCliError(code, message, details) {
   return error;
 }
 
-function requestJson(state, endpoint, payload) {
+function requestJson(instance, endpoint, payload, { timeoutMs } = {}) {
   const requestBody = endpoint === "/health" ? undefined : JSON.stringify(payload || {});
 
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: "127.0.0.1",
-      port: state.port,
+      port: instance.port,
       path: endpoint,
       method: endpoint === "/health" ? "GET" : "POST",
       headers: {
-        Authorization: `Bearer ${state.token}`,
+        Authorization: `Bearer ${instance.token}`,
         "Content-Type": "application/json",
         "Content-Length": requestBody ? Buffer.byteLength(requestBody) : 0
       }
@@ -292,7 +385,7 @@ function requestJson(state, endpoint, payload) {
             reject(createCliError(
               "invalid_bridge_response",
               "Notebook Bridge returned invalid JSON.",
-              { endpoint, reason: error.message, body }
+              { endpoint, reason: error.message, body, pid: instance.pid }
             ));
             return;
           }
@@ -305,7 +398,8 @@ function requestJson(state, endpoint, payload) {
             {
               endpoint,
               status_code: res.statusCode,
-              state_file: state.state_file
+              pid: instance.pid,
+              port: instance.port
             }
           ));
           return;
@@ -315,14 +409,20 @@ function requestJson(state, endpoint, payload) {
       });
     });
 
+    if (Number.isInteger(timeoutMs)) {
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error(`Timed out after ${timeoutMs}ms`));
+      });
+    }
+
     req.on("error", (error) => {
       if (error.code === "ECONNREFUSED") {
         reject(createCliError(
           "bridge_not_listening",
-          `Notebook Bridge is not listening on 127.0.0.1:${state.port}. Open VS Code and run 'Notebook Bridge: Show Server Info' again.`,
+          `Notebook Bridge is not listening on 127.0.0.1:${instance.port} (pid ${instance.pid}). Open VS Code and run 'Notebook Bridge: Show Server Info' again.`,
           {
-            port: state.port,
-            state_file: state.state_file
+            port: instance.port,
+            pid: instance.pid
           }
         ));
         return;
@@ -334,7 +434,8 @@ function requestJson(state, endpoint, payload) {
         {
           endpoint,
           reason: error.message,
-          state_file: state.state_file
+          pid: instance.pid,
+          port: instance.port
         }
       ));
     });
@@ -844,45 +945,76 @@ async function runCommand(command, args) {
     return;
   }
 
-  const state = loadState();
-
   if (command === "status") {
-    const health = await requestJson(state, "/health");
-    success("status", {
-      state_file: state.state_file,
-      extension_path: state.extension_path,
-      port: state.port,
-      updated_at: state.updated_at || null,
-      health
+    const instances = loadLiveInstances();
+    const windows = await Promise.all(instances.map(async (instance) => {
+      try {
+        const health = await requestJson(instance, "/health", undefined, { timeoutMs: 4000 });
+        return { ...describeInstance(instance), reachable: true, health };
+      } catch (error) {
+        return {
+          ...describeInstance(instance),
+          reachable: false,
+          error: { code: error.code || "unexpected_error", message: error.message }
+        };
+      }
+    }));
+    success("status", { instance_count: instances.length, windows });
+    return;
+  }
+
+  if (command === "list-open") {
+    const instances = requireLiveInstances();
+    const probes = await Promise.all(instances.map(probeInstance));
+    success(command, {
+      windows: probes.map(({ instance, reachable, notebooks, error }) => ({
+        ...describeInstance(instance),
+        reachable,
+        notebooks: reachable ? notebooks : [],
+        error: reachable ? null : { code: error.code || "unexpected_error", message: error.message }
+      }))
     });
     return;
   }
 
-  await requestJson(state, "/health");
-
-  if (command === "list-open") {
-    const data = await requestJson(state, "/list-open", {});
+  if (command === "new-notebook") {
+    const instances = requireLiveInstances();
+    const pathIndex = args.indexOf("--path");
+    const filePath = pathIndex !== -1 ? args[pathIndex + 1] : undefined;
+    if (pathIndex !== -1 && !filePath) {
+      throw createCliError("invalid_argument", "Missing value after `--path`.");
+    }
+    const instance = resolveInstanceForNewNotebook(filePath, instances);
+    const data = await requestJson(instance, "/new-notebook", filePath ? { file_path: filePath } : {});
     success(command, data);
     return;
   }
 
+  if (!NOTEBOOK_TARGETED_COMMANDS.has(command)) {
+    throw createCliError("unknown_command", `Unknown command: ${command}`, { command });
+  }
+
+  const instances = requireLiveInstances();
+  const target = args[0];
+  const instance = target ? await resolveInstanceForTarget(target, instances) : null;
+
   if (command === "inspect" || command === "list-cells") {
-    const target = parseNotebookTargetArg(command, args);
-    const data = await readNotebookStructure(state, target);
+    parseNotebookTargetArg(command, args);
+    const data = await readNotebookStructure(instance, target);
     success(command === "list-cells" ? "list-cells" : "inspect", data);
     return;
   }
 
   if (command === "get") {
-    const target = parseNotebookTargetArg("get", args);
-    const data = await requestJson(state, "/get", normalizeNotebookTarget(target));
+    parseNotebookTargetArg("get", args);
+    const data = await requestJson(instance, "/get", normalizeNotebookTarget(target));
     success(command, data);
     return;
   }
 
   if (command === "get-cell") {
     const { target, cellRef } = parseNotebookAndIndexArgs("get-cell", args);
-    const data = await requestJson(state, "/get-cell", {
+    const data = await requestJson(instance, "/get-cell", {
       ...normalizeNotebookTarget(target),
       ...cellRef
     });
@@ -893,7 +1025,7 @@ async function runCommand(command, args) {
   if (command === "get-outputs") {
     const { target, cellRef } = parseNotebookAndIndexArgs("get-outputs", args);
     const print = args.includes("--print");
-    const data = await requestJson(state, "/get-outputs", {
+    const data = await requestJson(instance, "/get-outputs", {
       ...normalizeNotebookTarget(target),
       ...cellRef
     });
@@ -910,7 +1042,7 @@ async function runCommand(command, args) {
 
   if (command === "replace-cell") {
     const { target, cellRef, source, save } = parseReplaceCellArgs(args);
-    const data = await requestJson(state, "/replace-cell", {
+    const data = await requestJson(instance, "/replace-cell", {
       ...normalizeNotebookTarget(target),
       ...cellRef,
       source,
@@ -922,13 +1054,13 @@ async function runCommand(command, args) {
 
   if (command === "patch-cell") {
     const { target, cellRef, oldSource, newSource, save } = parsePatchCellArgs(args);
-    const cellData = await requestJson(state, "/get-cell", {
+    const cellData = await requestJson(instance, "/get-cell", {
       ...normalizeNotebookTarget(target),
       ...cellRef
     });
     const currentSource = cellData.cell?.source ?? cellData.source ?? "";
     const patchedSource = applyPatch(currentSource, oldSource, newSource);
-    const data = await requestJson(state, "/replace-cell", {
+    const data = await requestJson(instance, "/replace-cell", {
       ...normalizeNotebookTarget(target),
       ...cellRef,
       source: patchedSource,
@@ -940,7 +1072,7 @@ async function runCommand(command, args) {
 
   if (command === "run-cell") {
     const { target, cellRef, wait, timeout_ms, text } = parseRunCellArgs(args);
-    const data = await requestJson(state, "/run-cell", {
+    const data = await requestJson(instance, "/run-cell", {
       ...normalizeNotebookTarget(target),
       ...cellRef,
       wait,
@@ -959,7 +1091,7 @@ async function runCommand(command, args) {
 
   if (command === "replace-and-run") {
     const { target, cellRef, source, save, print, timeout_ms } = parseReplaceAndRunArgs(args);
-    const data = await requestJson(state, "/replace-and-run", {
+    const data = await requestJson(instance, "/replace-and-run", {
       ...normalizeNotebookTarget(target),
       ...cellRef,
       source,
@@ -979,7 +1111,7 @@ async function runCommand(command, args) {
 
   if (command === "run-all") {
     const { target, wait, timeout_ms } = parseRunAllArgs(args);
-    const data = await requestJson(state, "/run-all", {
+    const data = await requestJson(instance, "/run-all", {
       ...normalizeNotebookTarget(target),
       wait,
       timeout_ms
@@ -990,7 +1122,7 @@ async function runCommand(command, args) {
 
   if (command === "add-cell") {
     const { target, cellIndex, kind, language, source, save } = parseAddCellArgs(args);
-    const data = await requestJson(state, "/add-cell", {
+    const data = await requestJson(instance, "/add-cell", {
       ...normalizeNotebookTarget(target),
       cell_index: cellIndex,
       kind,
@@ -1004,7 +1136,7 @@ async function runCommand(command, args) {
 
   if (command === "delete-cell") {
     const { target, cellRef, save } = parseNotebookAndIndexArgs("delete-cell", args);
-    const data = await requestJson(state, "/delete-cell", {
+    const data = await requestJson(instance, "/delete-cell", {
       ...normalizeNotebookTarget(target),
       ...cellRef,
       save
@@ -1016,7 +1148,7 @@ async function runCommand(command, args) {
   if (command === "find-error") {
     const target = parseNotebookTargetArg("find-error", args);
     const all = args.includes("--all");
-    const data = await requestJson(state, "/find-error", normalizeNotebookTarget(target));
+    const data = await requestJson(instance, "/find-error", normalizeNotebookTarget(target));
     if (all) {
       success(command, {
         notebook_uri: data.notebook_uri,
@@ -1032,17 +1164,6 @@ async function runCommand(command, args) {
       error_count: data.error_count,
       first_error: data.first_error
     });
-    return;
-  }
-
-  if (command === "new-notebook") {
-    const pathIndex = args.indexOf("--path");
-    const filePath = pathIndex !== -1 ? args[pathIndex + 1] : undefined;
-    if (pathIndex !== -1 && !filePath) {
-      throw createCliError("invalid_argument", "Missing value after `--path`.");
-    }
-    const data = await requestJson(state, "/new-notebook", filePath ? { file_path: filePath } : {});
-    success(command, data);
     return;
   }
 
